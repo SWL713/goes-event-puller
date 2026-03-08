@@ -12,35 +12,25 @@ import requests
 import xarray as xr
 
 
-# ============================================================
-# PATHS / CONFIG
-# ============================================================
-
 BASE_DIR = Path(__file__).resolve().parent.parent
 INPUT_FILE = BASE_DIR / "data" / "events.csv"
 OUTPUT_DIR = BASE_DIR / "data" / "output"
 CACHE_DIR = BASE_DIR / "data" / "cache"
+FAILED_LOG = BASE_DIR / "data" / "failed_events.csv"
 
 DEFAULT_WINDOW_HOURS = 24
 DEFAULT_CHANNELS = ["Hp", "Bt"]
 TIMEOUT = 60
 
-# Modern GOES-R / GOES-U archive
 GOESR_BASE = "https://data.ngdc.noaa.gov/platforms/solar-space-observing-satellites/goes"
-
-# Legacy GOES 8-15 archive
 LEGACY_BASE = "https://www.ncei.noaa.gov/data/goes-space-environment-monitor/access/avg"
 
 OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 CACHE_DIR.mkdir(parents=True, exist_ok=True)
 
 SESSION = requests.Session()
-SESSION.headers.update({"User-Agent": "goes-event-puller/1.1"})
+SESSION.headers.update({"User-Agent": "goes-event-puller/1.2"})
 
-
-# ============================================================
-# SATELLITE MAPPING
-# ============================================================
 
 def east_satellite_for_time(ts: datetime) -> str:
     if ts < datetime(2003, 4, 1, tzinfo=timezone.utc):
@@ -57,10 +47,6 @@ def east_satellite_for_time(ts: datetime) -> str:
 def is_goesr_satellite(sat: str) -> bool:
     return sat in {"goes16", "goes17", "goes18", "goes19"}
 
-
-# ============================================================
-# INPUT PARSING
-# ============================================================
 
 def parse_user_timestamp(value: str) -> datetime:
     text = str(value).strip()
@@ -95,30 +81,37 @@ def load_events(path: Path) -> pd.DataFrame:
     return df
 
 
-# ============================================================
-# DOWNLOAD HELPERS
-# ============================================================
-
 def download_file(url: str, outpath: Path) -> bool:
     print(f"Downloading: {url}")
-    r = SESSION.get(url, timeout=TIMEOUT)
-    if r.status_code == 200:
-        outpath.write_bytes(r.content)
-        return True
-    print(f"  -> HTTP {r.status_code}", file=sys.stderr)
-    return False
+    try:
+        r = SESSION.get(url, timeout=TIMEOUT)
+        r.raise_for_status()
+    except requests.exceptions.HTTPError as e:
+        status = e.response.status_code if e.response is not None else "unknown"
+        print(f"  -> HTTP {status}", file=sys.stderr)
+        if status == 404:
+            return False
+        raise
+    except requests.RequestException:
+        raise
+
+    outpath.write_bytes(r.content)
+    return True
 
 
-def fetch_text(url: str) -> str:
+def fetch_text(url: str) -> str | None:
     print(f"Listing: {url}")
-    r = SESSION.get(url, timeout=TIMEOUT)
-    r.raise_for_status()
-    return r.text
+    try:
+        r = SESSION.get(url, timeout=TIMEOUT)
+        r.raise_for_status()
+        return r.text
+    except requests.exceptions.HTTPError as e:
+        status = e.response.status_code if e.response is not None else "unknown"
+        print(f"  -> HTTP {status}", file=sys.stderr)
+        if status == 404:
+            return None
+        raise
 
-
-# ============================================================
-# MODERN GOES-R / GOES-U
-# ============================================================
 
 def goesr_month_dir(sat: str, day: datetime) -> str:
     yyyy = day.strftime("%Y")
@@ -126,29 +119,25 @@ def goesr_month_dir(sat: str, day: datetime) -> str:
     return f"{GOESR_BASE}/{sat}/l2/data/magn-l2-avg1m/{yyyy}/{mm}/"
 
 
-def find_goesr_filename(sat: str, day: datetime) -> str:
-    """
-    Discover the exact filename from the directory listing, so we do not
-    hard-code a version suffix like v2-0-0 or v2-0-2.
-    """
+def find_goesr_filename(sat: str, day: datetime) -> str | None:
     sat_num = sat.replace("goes", "")
     yyyymmdd = day.strftime("%Y%m%d")
     month_url = goesr_month_dir(sat, day)
     html = fetch_text(month_url)
 
+    if html is None:
+        return None
+
     pattern = rf"dn_magn-l2-avg1m_g{sat_num}_d{yyyymmdd}_v[\d\-]+\.nc"
     matches = re.findall(pattern, html)
 
     if not matches:
-        raise FileNotFoundError(
-            f"Could not find GOES-R/U file for {sat} on {yyyymmdd} in {month_url}"
-        )
+        return None
 
-    # Usually exactly one match
     return sorted(set(matches))[-1]
 
 
-def ensure_goesr_daily_file(sat: str, day: datetime) -> Path:
+def ensure_goesr_daily_file(sat: str, day: datetime) -> Path | None:
     tag = day.strftime("%Y%m%d")
     cached = CACHE_DIR / f"{sat}_{tag}.nc"
     if cached.exists():
@@ -156,15 +145,14 @@ def ensure_goesr_daily_file(sat: str, day: datetime) -> Path:
         return cached
 
     filename = find_goesr_filename(sat, day)
+    if filename is None:
+        return None
+
     url = goesr_month_dir(sat, day) + filename
     if not download_file(url, cached):
-        raise FileNotFoundError(f"Could not download modern file: {url}")
+        return None
     return cached
 
-
-# ============================================================
-# LEGACY GOES 8-15
-# ============================================================
 
 def month_start(day: datetime) -> datetime:
     return day.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
@@ -198,7 +186,7 @@ def legacy_month_filename(sat: str, month_day: datetime) -> str:
     return f"g{sat_num}_magneto_1m_{yyyy}{mm}01_{yyyy}{mm}{last_day:02d}.nc"
 
 
-def ensure_legacy_month_file(sat: str, month_day: datetime) -> Path:
+def ensure_legacy_month_file(sat: str, month_day: datetime) -> Path | None:
     tag = month_day.strftime("%Y%m")
     cached = CACHE_DIR / f"{sat}_{tag}.nc"
     if cached.exists():
@@ -208,13 +196,9 @@ def ensure_legacy_month_file(sat: str, month_day: datetime) -> Path:
     filename = legacy_month_filename(sat, month_day)
     url = legacy_month_dir(sat, month_day) + filename
     if not download_file(url, cached):
-        raise FileNotFoundError(f"Could not download legacy file: {url}")
+        return None
     return cached
 
-
-# ============================================================
-# NETCDF HANDLING
-# ============================================================
 
 def find_time_column(df: pd.DataFrame) -> str:
     preferred = ["time", "time_tag", "time_utc", "datetime"]
@@ -243,7 +227,6 @@ def normalize_columns(df: pd.DataFrame) -> pd.DataFrame:
         elif low in {"hn", "h_n"}:
             rename_map[col] = "Hn"
         elif low in {"bt", "ht", "b_total", "total_field"}:
-            # Some files use Ht rather than Bt for total field.
             rename_map[col] = "Bt"
 
     return df.rename(columns=rename_map)
@@ -264,10 +247,6 @@ def open_netcdf_as_dataframe(nc_path: Path) -> pd.DataFrame:
 
     return df
 
-
-# ============================================================
-# WINDOW EXTRACTION
-# ============================================================
 
 def daterange(start_day: datetime, end_day: datetime) -> Iterable[datetime]:
     cur = start_day
@@ -298,6 +277,7 @@ def build_event_csv(
     print(f"  window: {start.isoformat()}  ->  {end.isoformat()}")
 
     pieces: List[pd.DataFrame] = []
+    missing_files: List[str] = []
 
     if is_goesr_satellite(sat):
         start_day = start.replace(hour=0, minute=0, second=0, microsecond=0)
@@ -305,19 +285,34 @@ def build_event_csv(
 
         for day in daterange(start_day, end_day):
             local_nc = ensure_goesr_daily_file(sat, day)
+            if local_nc is None:
+                missing_files.append(day.strftime("%Y-%m-%d"))
+                continue
             pieces.append(open_netcdf_as_dataframe(local_nc))
     else:
         for mon in month_range(start, end):
             local_nc = ensure_legacy_month_file(sat, mon)
+            if local_nc is None:
+                missing_files.append(mon.strftime("%Y-%m"))
+                continue
             pieces.append(open_netcdf_as_dataframe(local_nc))
+
+    if not pieces:
+        missing_desc = ", ".join(missing_files) if missing_files else "unknown"
+        raise FileNotFoundError(
+            f"No source files available for {event_id} ({sat}). Missing: {missing_desc}"
+        )
 
     df = pd.concat(pieces, ignore_index=True)
     df = df[(df["time_utc"] >= start) & (df["time_utc"] <= end)].copy()
 
+    if df.empty:
+        raise ValueError(f"No rows found inside requested window for {event_id}")
+
     available = [c for c in channels if c in df.columns]
-    missing = [c for c in channels if c not in df.columns]
-    if missing:
-        print(f"  warning: missing channels in file: {missing}", file=sys.stderr)
+    missing_channels = [c for c in channels if c not in df.columns]
+    if missing_channels:
+        print(f"  warning: missing channels in file: {missing_channels}", file=sys.stderr)
 
     df = df[["time_utc"] + available].copy()
     df["event_id"] = event_id
@@ -340,16 +335,13 @@ def build_event_csv(
     return outpath
 
 
-# ============================================================
-# MAIN
-# ============================================================
-
 def main() -> int:
     print(f"Reading events from: {INPUT_FILE}")
     events = load_events(INPUT_FILE)
 
     created = 0
     failed = 0
+    failures = []
 
     for _, row in events.iterrows():
         event_id = str(row["event_id"])
@@ -362,13 +354,23 @@ def main() -> int:
             created += 1
         except Exception as exc:
             failed += 1
+            failures.append({
+                "event_id": event_id,
+                "center_time_utc": center_time.isoformat(),
+                "error": str(exc),
+            })
             print(f"\n[FAIL] {event_id}: {exc}", file=sys.stderr)
+
+    if failures:
+        pd.DataFrame(failures).to_csv(FAILED_LOG, index=False)
+        print(f"\nWrote failure log: {FAILED_LOG}")
 
     print("\nFinished.")
     print(f"  created: {created}")
     print(f"  failed:  {failed}")
 
-    return 0 if failed == 0 else 1
+    # Succeed if at least one event worked
+    return 0 if created > 0 else 1
 
 
 if __name__ == "__main__":
