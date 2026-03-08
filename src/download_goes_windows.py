@@ -41,11 +41,11 @@ OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 CACHE_DIR.mkdir(parents=True, exist_ok=True)
 
 SESSION = requests.Session()
-SESSION.headers.update({"User-Agent": "goes-event-review-batch/1.0"})
+SESSION.headers.update({"User-Agent": "goes-event-review-batch/2.0"})
 
 
 # ============================================================
-# PICKER SETTINGS (current v4-ish baseline)
+# PICKER SETTINGS
 # ============================================================
 
 PICKER_SETTINGS = {
@@ -263,18 +263,27 @@ def find_time_column(df: pd.DataFrame) -> str:
     raise KeyError(f"No time column found. Columns: {list(df.columns)}")
 
 
-def normalize_columns(df: pd.DataFrame) -> pd.DataFrame:
-    rename_map = {}
-    for col in df.columns:
-        low = col.lower()
+def normalize_var_name(name: str) -> str:
+    return re.sub(r"[^a-z0-9]", "", str(name).lower())
 
-        if low in {"hp", "h_p"}:
+
+def normalize_columns(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Robust historical variable normalization.
+    Older files can use Hp, H_p, hp, he, hn, ht, B_total, etc.
+    """
+    rename_map: dict[str, str] = {}
+
+    for col in df.columns:
+        n = normalize_var_name(col)
+
+        if n in {"hp", "hpmag", "hpavg", "hpavg1m"}:
             rename_map[col] = "Hp"
-        elif low in {"he", "h_e"}:
+        elif n in {"he", "hemag", "heavg", "heavg1m"}:
             rename_map[col] = "He"
-        elif low in {"hn", "h_n"}:
+        elif n in {"hn", "hnmag", "hnavg", "hnavg1m"}:
             rename_map[col] = "Hn"
-        elif low in {"bt", "ht", "b_total", "total_field"}:
+        elif n in {"bt", "ht", "btotal", "totalfield", "htavg", "btavg"}:
             rename_map[col] = "Bt"
 
     return df.rename(columns=rename_map)
@@ -288,6 +297,16 @@ def open_netcdf_as_dataframe(nc_path: Path) -> pd.DataFrame:
     time_col = find_time_column(df)
     df["time_utc"] = pd.to_datetime(df[time_col], utc=True, errors="coerce")
     df = df.dropna(subset=["time_utc"]).copy()
+
+    # If Hp still not present, try a second-pass alias scan directly on original names
+    if "Hp" not in df.columns:
+        hp_candidates = []
+        for c in df.columns:
+            n = normalize_var_name(c)
+            if n in {"hp", "hpmag", "hpavg", "hpavg1m"}:
+                hp_candidates.append(c)
+        if hp_candidates:
+            df["Hp"] = pd.to_numeric(df[hp_candidates[0]], errors="coerce")
 
     keep_cols = ["time_utc"] + [c for c in ["Hp", "He", "Hn", "Bt"] if c in df.columns]
     df = df[keep_cols].copy()
@@ -348,7 +367,14 @@ def load_event_window(
     df = df[(df["time_utc"] >= start) & (df["time_utc"] <= end)].copy()
     df = df.sort_values("time_utc").drop_duplicates(subset=["time_utc"])
 
+    if "Hp" not in df.columns:
+        raise ValueError(f"Expected Hp column. Columns found: {list(df.columns)}")
+
     keep_cols = ["time_utc"] + [c for c in channels if c in df.columns]
+    if "Hp" not in keep_cols:
+        keep_cols.append("Hp")
+
+    keep_cols = [c for c in keep_cols if c in df.columns]
     df = df[keep_cols].copy()
 
     return df, sat
@@ -391,7 +417,6 @@ def prep_trace(df: pd.DataFrame) -> pd.DataFrame:
         .reset_index()
     )
 
-    # spike flag
     out["jump"] = out["Hp"].diff().abs()
     out["hp_smooth_3"] = out["Hp"].rolling(3, center=True, min_periods=1).median()
     out["hp_baseline_180"] = out["hp_smooth_3"].rolling(180, center=True, min_periods=30).median()
@@ -456,7 +481,6 @@ def is_macro_top_region(work: pd.DataFrame, idx: int) -> bool:
 
     near_top = pos >= float(PICKER_SETTINGS["macro_top_quantile"])
     flat_or_turning = abs(float(slope)) <= float(PICKER_SETTINGS["macro_flat_slope_abs_threshold"])
-
     return bool(near_top and flat_or_turning)
 
 
@@ -464,8 +488,6 @@ def is_obvious_spike(work: pd.DataFrame, idx: int) -> bool:
     spike_jump = float(PICKER_SETTINGS["spike_jump_nt"])
     here = float(work.loc[idx, "jump"]) if idx < len(work) else 0.0
     prev = float(work.loc[idx - 1, "jump"]) if idx - 1 >= 0 else 0.0
-
-    # Also catches one-minute blips
     return max(here, prev) >= spike_jump
 
 
@@ -543,7 +565,6 @@ def detect_g_candidates(df: pd.DataFrame) -> tuple[pd.DataFrame, List[DetectionR
             if not valid:
                 continue
 
-            # pick first credible downslope
             score = (
                 (-future_8) * 1.8
                 + (-future_15) * 1.0
@@ -595,7 +616,7 @@ def detect_g_candidates(df: pd.DataFrame) -> tuple[pd.DataFrame, List[DetectionR
 
 
 # ============================================================
-# OUTPUTS
+# PLOTTING / OUTPUTS
 # ============================================================
 
 def make_event_plot(trace_df: pd.DataFrame, detections: List[DetectionResult], title: str, outpath: Path) -> None:
@@ -632,10 +653,6 @@ def make_event_plot(trace_df: pd.DataFrame, detections: List[DetectionResult], t
     plt.close(fig)
 
 
-# ============================================================
-# REVIEW PACKET BUILDER
-# ============================================================
-
 def write_review_template(outpath: Path, event_id: str, detections: List[DetectionResult]) -> None:
     rows = []
     for det in detections:
@@ -649,7 +666,6 @@ def write_review_template(outpath: Path, event_id: str, detections: List[Detecti
             }
         )
 
-    # Leave a few blank rows so user can add missed picks
     for _ in range(6):
         rows.append(
             {
@@ -664,6 +680,10 @@ def write_review_template(outpath: Path, event_id: str, detections: List[Detecti
     pd.DataFrame(rows).to_csv(outpath, index=False)
 
 
+# ============================================================
+# EVENT PROCESSING
+# ============================================================
+
 def process_event(row: pd.Series) -> dict:
     event_id = str(row["event_id"])
     center_time = row["center_time_utc"]
@@ -674,31 +694,24 @@ def process_event(row: pd.Series) -> dict:
     event_dir.mkdir(parents=True, exist_ok=True)
 
     df, sat = load_event_window(event_id, center_time, window_hours, channels)
-
     trace_df, detections = detect_g_candidates(df)
 
-    # raw window with metadata columns
     out_df = df.copy()
     out_df["event_id"] = event_id
     out_df["center_time_utc"] = center_time.isoformat()
     out_df["source_satellite"] = sat
     out_df.to_csv(event_dir / f"{event_id}_goes_window.csv", index=False)
 
-    # candidates
     cand_df = pd.DataFrame([asdict(d) for d in detections])
     cand_df.to_csv(event_dir / f"{event_id}_g_candidates.csv", index=False)
 
-    # cleaned trace used by picker
     trace_df.to_csv(event_dir / f"{event_id}_trace_used.csv", index=False)
 
-    # plot
     title = f"{event_id} | GOES-East historical review | center={center_time.strftime('%Y-%m-%d %H:%M UTC')}"
     make_event_plot(trace_df, detections, title, event_dir / f"{event_id}_plot.png")
 
-    # review template
     write_review_template(event_dir / f"{event_id}_review_template.csv", event_id, detections)
 
-    # summary
     summary = {
         "event_id": event_id,
         "center_time_utc": center_time.isoformat(),
@@ -749,7 +762,6 @@ def main() -> int:
     print(f"  created: {created}")
     print(f"  failed:  {failed}")
 
-    # succeed if at least one event succeeded
     return 0 if created > 0 else 1
 
 
