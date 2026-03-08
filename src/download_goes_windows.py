@@ -24,10 +24,10 @@ DEFAULT_WINDOW_HOURS = 24
 DEFAULT_CHANNELS = ["Hp", "Bt"]   # add "He", "Hn" if wanted
 
 # Output folders
-BASE_DIR = Path(__file__).resolve().parent
-INPUT_FILE = BASE_DIR / "events.csv"
-OUTPUT_DIR = BASE_DIR / "output"
-CACHE_DIR = BASE_DIR / "cache"
+BASE_DIR = Path(__file__).resolve().parent.parent
+INPUT_FILE = BASE_DIR / "data" / "events.csv"
+OUTPUT_DIR = BASE_DIR / "data" / "output"
+CACHE_DIR = BASE_DIR / "data" / "cache"
 
 # NOAA / NCEI bases
 GOESR_BASE = "https://www.ncei.noaa.gov/data/goes-space-environment-monitor/access"
