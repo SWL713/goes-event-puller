@@ -8,25 +8,42 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
+
       - name: Checkout repository
         uses: actions/checkout@v4
+
 
       - name: Setup Python
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
 
+
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
+
       - name: Run GOES downloader
         run: |
           python src/download_goes_windows.py
 
-      - name: Upload results
+
+      # Show output directory for debugging
+      - name: List output files
+        run: |
+          echo "==== OUTPUT FILES ===="
+          ls -R data || true
+
+
+      # Upload results even if some steps failed
+      - name: Upload results artifact
         uses: actions/upload-artifact@v4
+        if: always()
         with:
           name: goes-event-output
-          path: data/output/
+          path: |
+            data/output/**
+            data/failed_events.csv
+          if-no-files-found: warn
