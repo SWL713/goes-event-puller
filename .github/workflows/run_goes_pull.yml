@@ -21,11 +21,15 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      - name: Run historical review batch
+      - name: Pull historical GOES windows
         run: |
           python src/download_goes_windows.py
 
-      - name: Show output files
+      - name: Run frozen baseline picker on windows
+        run: |
+          python src/run_picker_on_windows.py
+
+      - name: Show output tree
         if: always()
         run: |
           echo "=== output tree ==="
